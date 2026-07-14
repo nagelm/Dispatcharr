@@ -68,6 +68,7 @@ from .stats import (
     resolve_stats_playback_fields,
     seed_stream_stats_metadata,
 )
+from .transcode import ProfileTranscodeProcess
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,26 @@ _STOP_REASON_LIMIT = "limit"
 _TERMINAL_STOP_REASONS = frozenset({
     _STOP_REASON_HOP, _STOP_REASON_ADMIN, _STOP_REASON_LIMIT,
 })
+_PROCESS_READ_POLL_SECONDS = 1.0  # Stop-key poll cadence while a transcode pipe is quiet.
+
+
+def _channel_transcode_profile(channel):
+    """The channel's explicit StreamProfile when it implies a command.
+
+    Archives are recordings of the same encoder output as the live feed, so
+    a channel whose live stream needs a profile treatment (SEI stripping,
+    transcoding) needs it on catch-up too. Only explicitly assigned profiles
+    count — channels on the system default keep the raw passthrough path.
+    The built-in proxy profile builds no command, and redirect semantics are
+    treated as passthrough for catch-up (the proxy already holds the
+    provider connection at this point).
+    """
+    if not channel.stream_profile_id:
+        return None
+    profile = channel.stream_profile
+    if profile is None or profile.is_proxy() or profile.is_redirect():
+        return None
+    return profile
 
 
 def _finalize_timeshift_response(response):
@@ -350,6 +371,15 @@ def _serve_catchup(request, user, channel, timestamp, client_duration_hint=None)
     client_user_agent = request.META.get("HTTP_USER_AGENT", "") or ""
     range_header = request.META.get("HTTP_RANGE")
     channel_logo_id = getattr(channel, "logo_id", None)
+
+    if _channel_transcode_profile(channel) is not None and range_header:
+        # Profile output is generated on the fly and is not byte-addressable,
+        # so Range cannot be honored (RFC 7233 permits ignoring it). Players
+        # seek catch-up by re-requesting with a new start time.
+        logger.debug(
+            "Timeshift: ignoring Range for profiled channel %s", channel.id,
+        )
+        range_header = None
 
     redis_client = RedisClient.get_client()
 
@@ -2163,6 +2193,44 @@ def _iter_upstream_with_stop(
         yield chunk
 
 
+def _iter_process_with_stop(
+    proc,
+    chunk_size,
+    redis_client,
+    stop_key,
+    stream_generation,
+    *,
+    inactivity_timeout=_STREAM_READ_INACTIVITY_SECONDS,
+):
+    """Yield transcode-process bytes, polling the stop key between reads."""
+    last_data_at = time.time()
+    while True:
+        if (
+            inactivity_timeout is not None
+            and time.time() - last_data_at >= inactivity_timeout
+        ):
+            logger.info(
+                "Timeshift transcode inactive for %ss, closing stream",
+                inactivity_timeout,
+            )
+            proc.close()
+            break
+        should_stop, _ = _stream_stop_requested(
+            redis_client, stop_key, stream_generation,
+        )
+        if should_stop:
+            proc.close()
+            break
+        chunk = proc.read(chunk_size, _PROCESS_READ_POLL_SECONDS)
+        if chunk is None:
+            # Poll timeout: loop back to check the stop key (live-proxy pattern).
+            continue
+        if not chunk:
+            break
+        last_data_at = time.time()
+        yield chunk
+
+
 def _release_pool_session(
     redis_client, session_id, profile_id, *,
     mark_pool_idle=True, release_profile=True,
@@ -2526,6 +2594,7 @@ def _attempt_timeshift_stream(
         candidate_urls=candidate_urls,
         user_agent=user_agent,
         range_header=range_header,
+        channel_stream_profile=_channel_transcode_profile(channel),
         virtual_channel_id=virtual_channel_id,
         stats_channel_id=stats_channel_id,
         client_id=client_id,
@@ -2989,6 +3058,7 @@ def _stream_from_provider(
     candidate_urls,
     user_agent,
     range_header,
+    channel_stream_profile=None,
     virtual_channel_id,
     stats_channel_id=None,
     client_id,
@@ -3168,8 +3238,46 @@ def _stream_from_provider(
     content_range = upstream.headers.get("Content-Range", "")
     status = upstream.status_code
 
-    _store_pool_content_length(redis_client, pool_session_id, upstream)
-    _store_pool_serving_range(redis_client, pool_session_id, range_header)
+
+    # Channel has an explicit stream profile: the archive is the same encoder
+    # output as the live feed, so pipe it through the same command live uses.
+    # The probe above verified the archive exists and picked the URL shape;
+    # the profile command owns its own provider connection from here on.
+    transcode_proc = None
+    if channel_stream_profile is not None:
+        profile_cmd = channel_stream_profile.build_command(last_url, user_agent)
+        if profile_cmd:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+            try:
+                transcode_proc = ProfileTranscodeProcess(profile_cmd).start()
+            except Exception as exc:
+                logger.error(
+                    "Timeshift profile command failed to start (%s): %s",
+                    channel_stream_profile.name, exc,
+                )
+                return _finalize_timeshift_response(
+                    HttpResponseBadRequest("Stream profile error")
+                )
+            if debug:
+                logger.debug(
+                    "Timeshift transcode started: profile=%s pid=%s vid=%s",
+                    channel_stream_profile.name, transcode_proc.pid,
+                    virtual_channel_id,
+                )
+            # Generated output: fresh 200 stream, no byte-length promises.
+            content_type = "video/mp2t"
+            content_range = ""
+            status = 200
+
+    if transcode_proc is None:
+        # Byte bookkeeping describes the provider response we are about to
+        # relay verbatim. Under a profile the served bytes are generated, so
+        # these keys would describe a stream nobody is serving.
+        _store_pool_content_length(redis_client, pool_session_id, upstream)
+        _store_pool_serving_range(redis_client, pool_session_id, range_header)
     # Capture post-redirect CDN URL for reconnects (VOD final_url pattern).
     resolved_url = getattr(upstream, "url", None) or last_url
     if resolved_url:
@@ -3177,6 +3285,8 @@ def _stream_from_provider(
     # Portal opens define (or redefine) the session archive window; CDN scrubs reuse it.
     # force=False: after keep_archive=False clear, these keys are empty and get set;
     # after CDN→portal fallback mid-session, keep the original anchor.
+    # Session metadata rather than byte state, so profiled sessions get an
+    # archive window too: this stays outside the transcode guard.
     _ensure_pool_archive_anchor(
         redis_client,
         pool_session_id,
@@ -3185,68 +3295,72 @@ def _stream_from_provider(
         force=False,
     )
 
-    representation_length = _extract_representation_length(upstream)
-    if representation_length is None and redis_client and pool_session_id:
-        cached_length = redis_client.hget(
-            _pool_key(pool_session_id), "content_length",
-        )
-        if cached_length is not None:
-            try:
-                if isinstance(cached_length, bytes):
-                    cached_length = cached_length.decode()
-                representation_length = int(cached_length)
-            except (TypeError, ValueError):
-                representation_length = None
+    if transcode_proc is None:
+        representation_length = _extract_representation_length(upstream)
+        if representation_length is None and redis_client and pool_session_id:
+            cached_length = redis_client.hget(
+                _pool_key(pool_session_id), "content_length",
+            )
+            if cached_length is not None:
+                try:
+                    if isinstance(cached_length, bytes):
+                        cached_length = cached_length.decode()
+                    representation_length = int(cached_length)
+                except (TypeError, ValueError):
+                    representation_length = None
 
-    if rewrite_plain_get and status == 206:
-        # Client sent a plain GET with a new start; we injected CDN Range.
-        # Present a provider-like 200 with remaining Content-Length.
-        remaining = presentation_remaining
-        if remaining is None and representation_length is not None:
-            start = _parse_range_start(range_header) or 0
-            remaining = max(int(representation_length) - int(start), 0)
-        status = 200
-        content_range = ""
-        client_length_headers = {"Accept-Ranges": "bytes"}
-        if remaining is not None:
-            client_length_headers["Content-Length"] = str(remaining)
-            byte_base = presentation_byte_base
-            if byte_base is None:
-                byte_base = _parse_range_start(range_header) or 0
-            _store_pool_presentation_window(
-                redis_client, pool_session_id, remaining, byte_base=byte_base,
+        if rewrite_plain_get and status == 206:
+            # Client sent a plain GET with a new start; we injected CDN Range.
+            # Present a provider-like 200 with remaining Content-Length.
+            remaining = presentation_remaining
+            if remaining is None and representation_length is not None:
+                start = _parse_range_start(range_header) or 0
+                remaining = max(int(representation_length) - int(start), 0)
+            status = 200
+            content_range = ""
+            client_length_headers = {"Accept-Ranges": "bytes"}
+            if remaining is not None:
+                client_length_headers["Content-Length"] = str(remaining)
+                byte_base = presentation_byte_base
+                if byte_base is None:
+                    byte_base = _parse_range_start(range_header) or 0
+                _store_pool_presentation_window(
+                    redis_client, pool_session_id, remaining, byte_base=byte_base,
+                )
+        else:
+            outbound_content_range = content_range or None
+            if relative_presentation_range and outbound_content_range:
+                outbound_content_range = _presentation_relative_content_range(
+                    outbound_content_range,
+                    presentation_byte_base=presentation_byte_base,
+                    presentation_length=presentation_remaining,
+                )
+            client_length_headers = _build_downstream_length_headers(
+                # Absolute CDN Range must not leak into Content-Range synthesis;
+                # the client still thinks this file starts at presentation byte 0.
+                range_header=None if relative_presentation_range else range_header,
+                status_code=status,
+                representation_length=(
+                    presentation_remaining
+                    if relative_presentation_range and presentation_remaining is not None
+                    else representation_length
+                ),
+                upstream_content_range=outbound_content_range,
+                upstream_content_length=upstream.headers.get("Content-Length"),
+                streaming=True,
             )
+            if presentation_remaining is not None and presentation_byte_base is not None:
+                _store_pool_presentation_window(
+                    redis_client, pool_session_id, presentation_remaining,
+                    byte_base=presentation_byte_base,
+                )
+            elif representation_length is not None and not range_header:
+                _store_pool_presentation_window(
+                    redis_client, pool_session_id, representation_length, byte_base=0,
+                )
     else:
-        outbound_content_range = content_range or None
-        if relative_presentation_range and outbound_content_range:
-            outbound_content_range = _presentation_relative_content_range(
-                outbound_content_range,
-                presentation_byte_base=presentation_byte_base,
-                presentation_length=presentation_remaining,
-            )
-        client_length_headers = _build_downstream_length_headers(
-            # Absolute CDN Range must not leak into Content-Range synthesis;
-            # the client still thinks this file starts at presentation byte 0.
-            range_header=None if relative_presentation_range else range_header,
-            status_code=status,
-            representation_length=(
-                presentation_remaining
-                if relative_presentation_range and presentation_remaining is not None
-                else representation_length
-            ),
-            upstream_content_range=outbound_content_range,
-            upstream_content_length=upstream.headers.get("Content-Length"),
-            streaming=True,
-        )
-        if presentation_remaining is not None and presentation_byte_base is not None:
-            _store_pool_presentation_window(
-                redis_client, pool_session_id, presentation_remaining,
-                byte_base=presentation_byte_base,
-            )
-        elif representation_length is not None and not range_header:
-            _store_pool_presentation_window(
-                redis_client, pool_session_id, representation_length, byte_base=0,
-            )
+        representation_length = None
+        client_length_headers = {}
 
     programme_duration_secs = None
     if duration_minutes:
@@ -3279,8 +3393,11 @@ def _stream_from_provider(
         emit_stats_update=True,
     )
 
-    peek_data = getattr(upstream, "_peek_data", None)
-    _register_active_upstream(virtual_channel_id, client_id, upstream)
+    peek_data = None if transcode_proc is not None else getattr(upstream, "_peek_data", None)
+    _register_active_upstream(
+        virtual_channel_id, client_id,
+        transcode_proc if transcode_proc is not None else upstream,
+    )
 
     session_closed = {"done": False}
 
@@ -3297,6 +3414,11 @@ def _stream_from_provider(
                 upstream.close()
             except Exception:
                 pass
+            if transcode_proc is not None:
+                try:
+                    transcode_proc.close()
+                except Exception:
+                    pass
         if release_slot:
             release_cb(
                 mark_pool_idle=mark_pool_idle,
@@ -3314,11 +3436,18 @@ def _stream_from_provider(
         )
         stream_started_logged = False
         stopped_for_reuse = False
-        try:
-            for data in _iter_upstream_with_stop(
+        if transcode_proc is not None:
+            source_iter = _iter_process_with_stop(
+                transcode_proc, chunk_size, redis_client, stop_key,
+                stream_generation,
+            )
+        else:
+            source_iter = _iter_upstream_with_stop(
                 upstream, chunk_size, redis_client, stop_key,
                 stream_generation, peek_data=peek_data,
-            ):
+            )
+        try:
+            for data in source_iter:
                 if not data:
                     continue
                 if debug and not stream_started_logged:
