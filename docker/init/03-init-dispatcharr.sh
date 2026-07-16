@@ -73,11 +73,17 @@ if [ "$(id -u)" = "0" ]; then
         fi
     done
 
-    # Fix app directories (recursive since they're managed by the app)
+    # Fix app directories (recursive since they're managed by the app).
+    # Chown unconditionally so a root-owned child under an already-correct
+    # parent is still healed; a top-level ownership check would skip it.
+    # Tolerate failure (read-only / chown-rejecting mounts) like DATA_DIRS
+    # so a bare chown can't abort the entrypoint under set -e.
     for dir in "${APP_DIRS[@]}"; do
-        if [ -d "$dir" ] && [ "$(stat -c '%u:%g' "$dir")" != "$PUID:$PGID" ]; then
-            echo "Fixing ownership for $dir (recursive)"
-            chown -R "$PUID:$PGID" "$dir"
+        if [ -d "$dir" ]; then
+            _chown_err=$(chown -R "$PUID:$PGID" "$dir" 2>&1) || {
+                _current_owner=$(stat -c '%u:%g' "$dir" 2>/dev/null || echo "unknown")
+                _failed_chown+=("$dir (current: $_current_owner, error: $_chown_err)")
+            }
         fi
     done
 
