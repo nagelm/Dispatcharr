@@ -280,15 +280,23 @@ else
     check_external_postgres_version || exit 1
 fi
 
-# Wait for Redis to be ready and flush stale state.
-# In modular mode Redis is external — call wait_for_redis.py here
-# because uWSGI's exec-pre runs under 'su -' which strips env vars
-# (DISPATCHARR_ENV, REDIS_HOST, etc.).
-# In AIO mode Redis is started by uWSGI (attach-daemon), so the
-# exec-pre in uwsgi.ini handles the wait + flush there instead.
+# Redis must be up before migrate/collectstatic below load Django. Start it
+# here (aio/dev/debug) or wait for the external one (modular).
 if [[ "$DISPATCHARR_ENV" == "modular" ]]; then
     echo "🔗 Modular mode: Using external Redis at ${REDIS_HOST}:${REDIS_PORT}"
     echo_with_timestamp "Waiting for Redis to be ready..."
+    python3 /app/scripts/wait_for_redis.py
+    echo "✅ Redis is ready"
+else
+    echo "🚀 Starting Redis..."
+    redis_extra_args=""
+    if [[ "$DISPATCHARR_ENV" == "dev" ]]; then
+        redis_extra_args="--protected-mode no"
+    fi
+    su - "$POSTGRES_USER" -c "cd /app && redis-server $redis_extra_args &"
+    redis_pid=$(pgrep -x redis-server | sort | head -n1)
+    echo "✅ Redis started with PID $redis_pid"
+    if [ -n "$redis_pid" ]; then pids+=("$redis_pid"); pid_names[$redis_pid]="redis"; fi
     python3 /app/scripts/wait_for_redis.py
     echo "✅ Redis is ready"
 fi
