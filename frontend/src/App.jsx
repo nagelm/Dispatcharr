@@ -11,6 +11,8 @@ import Channels from './pages/Channels';
 import ContentSources from './pages/ContentSources';
 import Guide from './pages/Guide';
 import Stats from './pages/Stats';
+import LogFilesPage from './pages/LogFiles';
+import LogFileViewPage from './pages/LogFileView';
 import DVR from './pages/DVR';
 import Settings from './pages/Settings';
 import PluginsPage from './pages/Plugins';
@@ -154,6 +156,11 @@ const App = () => {
                         <Route path="/guide" element={<Guide />} />
                         <Route path="/dvr" element={<DVR />} />
                         <Route path="/stats" element={<Stats />} />
+                        <Route path="/logs" element={<LogFilesPage />} />
+                        <Route
+                          path="/logs/:name"
+                          element={<LogFileViewPage />}
+                        />
                         <Route
                           path="/plugins/browse"
                           element={<PluginBrowsePage />}
