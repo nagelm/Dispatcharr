@@ -594,7 +594,7 @@ class StreamManager:
                                     channel_id=self.channel_id,
                                     channel_name=self.channel_name,
                                     error_type='connection_failed',
-                                    url=self.url[:100] if self.url else None,
+                                    url=self.url,
                                     attempts=self.max_retries
                                 )
                             except Exception as e:
@@ -624,8 +624,8 @@ class StreamManager:
                                     channel_id=self.channel_id,
                                     channel_name=self.channel_name,
                                     error_type='connection_exception',
-                                    error_message=str(e)[:200],
-                                    url=self.url[:100] if self.url else None,
+                                    error_message=str(e),
+                                    url=self.url,
                                     attempts=self.max_retries
                                 )
                             except Exception as log_error:
@@ -1550,7 +1550,7 @@ class StreamManager:
                     'stream_switch',
                     channel_id=self.channel_id,
                     channel_name=self.channel_name,
-                    new_url=new_url[:100] if new_url else None,
+                    new_url=new_url,
                     stream_id=stream_id
                 )
             except Exception as e:
