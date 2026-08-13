@@ -124,7 +124,7 @@ class TokenObtainPairView(TokenObtainPairView):
                 user=username or 'unknown',
                 client_ip=client_ip,
                 user_agent=user_agent,
-                reason=f'Authentication error: {str(e)[:100]}',
+                reason=f'Authentication error: {str(e)}',
             )
             logger.error(f"Login error for user={username}: {e}")
             raise  # Re-raise the exception to maintain normal error flow

@@ -221,6 +221,12 @@ class M3UAccountSerializer(serializers.ModelSerializer):
         if user is not None and getattr(user, "user_level", 0) >= 10:
             data["password"] = instance.password or ""
 
+        # last_message can quote the credentialed server_url in fetch errors.
+        if isinstance(data.get("last_message"), str):
+            from core.redaction import redact_text
+
+            data["last_message"] = redact_text(data["last_message"])
+
         # Parse custom_properties to get VOD preference and auto_enable_new_groups settings
         custom_props = instance.custom_properties or {}
 

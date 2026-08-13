@@ -1,5 +1,6 @@
 import re
 import time
+from core.redaction import redact_url
 from .server import ProxyServer
 from .redis_keys import RedisKeys
 from .constants import TS_PACKET_SIZE, ChannelMetadataField
@@ -39,7 +40,8 @@ class ChannelStatus:
         info = {
             'channel_id': channel_id,
             'state': metadata.get(ChannelMetadataField.STATE, 'unknown'),
-            'url': metadata.get(ChannelMetadataField.URL, ''),
+            # The raw URL stays in Redis for reconnect; mask it for the stats surface.
+            'url': redact_url(metadata.get(ChannelMetadataField.URL, '')),
             'stream_profile': metadata.get(ChannelMetadataField.STREAM_PROFILE, ''),
             'started_at': metadata.get(ChannelMetadataField.INIT_TIME, '0'),
             'owner': metadata.get(ChannelMetadataField.OWNER, 'unknown'),
@@ -418,7 +420,7 @@ class ChannelStatus:
             info = {
                 'channel_id': channel_id,
                 'state': metadata.get(ChannelMetadataField.STATE),
-                'url': metadata.get(ChannelMetadataField.URL, ""),
+                'url': redact_url(metadata.get(ChannelMetadataField.URL, "")),
                 'stream_profile': metadata.get(ChannelMetadataField.STREAM_PROFILE, ""),
                 'owner': metadata.get(ChannelMetadataField.OWNER),
                 'buffer_index': int(buffer_index_value) if buffer_index_value else 0,
