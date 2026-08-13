@@ -2,8 +2,9 @@
 
 import logging
 import sys
+from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from core.redaction import (
     RedactingFormatter,
@@ -431,3 +432,46 @@ class RedactingFormatterTests(SimpleTestCase):
         out = formatter.format(record)
         self.assertNotIn("s3cret", out)
         self.assertIn("/live/[username]/[password]/", out)
+
+
+class LogSystemEventRedactionTests(TestCase):
+    """Call-site redaction for system events and the Connect dispatch."""
+
+    @patch("core.utils._dispatch_system_event_integrations")
+    def test_event_details_are_redacted_at_write(self, mock_dispatch):
+        from core.models import SystemEvent
+        from core.utils import log_system_event
+
+        log_system_event(
+            "stream_switch",
+            channel_name="CNN",
+            new_url="http://host.tld/live/joe/s3cret/1.ts",
+            note="switch password=hunter2",
+        )
+
+        event = SystemEvent.objects.get(event_type="stream_switch")
+        self.assertEqual(event.details["new_url"], "http://host.tld/...")
+        self.assertEqual(event.details["note"], "switch password=[password]")
+
+        # The same redacted details go out to integrations, not the raw ones.
+        _, dispatch_kwargs = mock_dispatch.call_args
+        self.assertEqual(dispatch_kwargs["new_url"], "http://host.tld/...")
+        self.assertNotIn("hunter2", dispatch_kwargs["note"])
+
+    @patch("apps.connect.utils.trigger_event")
+    def test_dispatch_redacts_db_rederived_stream_url(self, mock_trigger):
+        # dispatch_event_system re-derives Stream.url from the DB after
+        # log_system_event redacted, so exercise the real dispatch body.
+        from apps.channels.models import Stream
+        from core.utils import dispatch_event_system
+
+        stream = Stream.objects.create(
+            name="CNN", url="http://host.tld/live/joe/s3cret/1.ts"
+        )
+        dispatch_event_system("stream_switch", stream_id=stream.id)
+
+        self.assertTrue(mock_trigger.called)
+        _, payload = mock_trigger.call_args[0]
+        self.assertNotIn("s3cret", str(payload))
+        self.assertEqual(payload.get("stream_url"), "http://host.tld/...")
+        self.assertEqual(payload.get("channel_url"), "http://host.tld/...")

@@ -3617,11 +3617,7 @@ def _stream_from_provider(
 
 
 def _redact_url(url):
-    """Truncate *url* to ``scheme://host/...`` for safe logging (drops credentials)."""
-    if not url or "://" not in url:
-        return url
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.split("@", 1)[1]
-    host = rest.split("/", 1)[0]
-    return f"{scheme}://{host}/..."
+    """Reduce *url* to scheme://host/... via the shared redaction util."""
+    from core.redaction import redact_url
+
+    return redact_url(url)

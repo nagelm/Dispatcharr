@@ -3326,14 +3326,16 @@ def refresh_account_info(profile_id):
         error_msg = f"Error refreshing account info for profile {profile_id}: {str(e)}"
         logger.error(error_msg)
 
+        from core.redaction import redact_text
+
         send_websocket_update(
             "updates",
             "update",
             {
                 "type": "account_refresh_error",
                 "profile_id": profile_id,
-                "error": str(e),
-                "message": f"Failed to refresh account info: {str(e)}"
+                "error": redact_text(str(e)),
+                "message": redact_text(f"Failed to refresh account info: {str(e)}"),
             }
         )
 
@@ -3980,6 +3982,12 @@ def send_m3u_update(account_id, action, progress, **kwargs):
 
     # Add the additional key-value pairs from kwargs
     data.update(kwargs)
+    # Status/error text can quote the credentialed server_url.
+    from core.redaction import redact_text
+
+    for _field in ("message", "error"):
+        if isinstance(data.get(_field), str):
+            data[_field] = redact_text(data[_field])
     send_websocket_update("updates", "update", data, collect_garbage=False)
 
     # Explicitly clear data reference to help garbage collection

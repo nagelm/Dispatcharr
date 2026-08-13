@@ -849,6 +849,12 @@ def dispatch_event_system(event_type, channel_id=None, channel_name=None, **deta
             if not payload[k]:
                 del payload[k]
 
+        # stream_url/channel_url were re-derived from the DB after
+        # log_system_event redacted, so mask the assembled payload again.
+        from core.redaction import redact_mapping
+
+        payload = redact_mapping(payload)
+
         trigger_event(event_type, payload)
 
     except Exception:
@@ -910,7 +916,11 @@ def log_system_event(event_type, channel_id=None, channel_name=None, **details):
                         stream_url='http://...', user='admin')
     """
     from core.models import SystemEvent, CoreSettings
+    from core.redaction import redact_mapping
     from django.db import close_old_connections
+
+    # Mask credentials before the DB write and the integrations dispatch.
+    details = redact_mapping(details)
 
     try:
         # Create the event
